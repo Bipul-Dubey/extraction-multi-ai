@@ -8,8 +8,8 @@ A Jupyter Notebook (`app.ipynb`) that cleans scanned police First Information Re
 
 ## Project rules
 
-1. **Everything lives in `app.ipynb`,** except one helper file, **`device.py`**, which detects the machine and picks settings (see *Hardware & device profiles*). Each preprocessing step has its own cell (markdown header + code).
-2. **No third-party AI or OCR.** Only classical image processing (OpenCV, NumPy).
+1. **Processing lives in `image_processing.py`; review lives in `app.ipynb`.** The notebook imports the module and runs the same functions step by step with tables and before/after views. `device.py` detects the machine and picks settings (see *Hardware & device profiles*).
+2. **Data stays local.** No cloud AI or APIs. Image preprocessing uses classical image processing only (OpenCV, NumPy). Local open-weight models (e.g. Qwen3-VL on the GB10, planned for extraction) are allowed.
 3. **Orientation follows the content.**
    - A landscape page with landscape content (medical tables, X-ray slips) **stays landscape**.
    - Pages are never forced into portrait.
@@ -444,6 +444,45 @@ The page-labelling work restarts after preprocessing is approved. Notes for late
 
 ---
 
+## Usage (`image_processing.py`)
+
+```python
+from image_processing import DocumentPreprocessor, preprocess_pdf
+
+pre = DocumentPreprocessor()                         # settings + device detected once; config={...}, device="mac"/"cuda"/"cpu"
+finals = pre.process("doc.pdf")                      # list[np.ndarray] RGB, one per page, page order (color="bgr" for OpenCV)
+pages  = pre.process("doc.pdf", return_all=True)     # list[PageResult]: .page .original .final .applied .files
+pre.process("doc.pdf", save=True)                    # also save, in the current directory
+pre.process("doc.pdf", save=True, output_dir="out")  # ... or in out/
+for page in pre.iter_pages("big.pdf"):               # one page at a time, for very large PDFs
+    ...
+pre.self_test()                                      # planted-content information-preservation test
+finals = preprocess_pdf("doc.pdf", save=True)        # one-line shortcut
+```
+
+Command line: `python image_processing.py doc1.pdf doc2.pdf -o out` (`--no-save`, `--device mac|cuda|cpu`).
+
+**Saved per page** (flat in the output folder, no per-PDF folder; page zero-padded to 3 digits):
+
+| File | What |
+|---|---|
+| `{pdf}_{page}_original.jpg` | Exact scan from the PDF, byte for byte (`.png` if the page had to be rendered) |
+| `{pdf}_{page}_final.png` | Cleaned colour page, **lossless**. This is the image to send to the model |
+| `{pdf}_{page}_applied.json` | Every step in pipeline order: applied yes/no, why, parameters used, result, flags, `needs_review` |
+
+**Which image to send to a model:**
+- Send `final` straight from memory (an uncompressed array), or the saved PNG, which is identical.
+- Use colour, not black-and-white: colour keeps faint ink, stamps, and blue vs. black ink.
+- Black & white is off by default (`CONFIG["output"]["bw"]["enabled"]`).
+
+**Verified:**
+- The module's final images are pixel-identical to the notebook's step-by-step output on all 71 sample pages.
+- Original JPEGs are byte-identical to the PDF.
+- `self_test()` passes.
+- About 90 s for 71 pages on the M5.
+
+---
+
 ## Getting started
 
 Requires **Python 3.12+**. On macOS the default `python3` (Xcode, 3.9) is too old for NumPy 2.5 / OpenCV 5, so use Homebrew's:
@@ -459,9 +498,9 @@ Run the cells top to bottom. Each step prints its per-page metrics and what it d
 
 ## Project structure
 
-- [app.ipynb](app.ipynb): the whole preprocessing pipeline, one cell per step.
+- [image_processing.py](image_processing.py): the whole preprocessing pipeline and its API (`DocumentPreprocessor`, `preprocess_pdf`, CLI).
+- [app.ipynb](app.ipynb): review notebook. It runs the module's steps one by one with tables and before/after views.
 - [device.py](device.py): detects Mac M5 / NVIDIA GB10 / generic CPU and returns the settings profile. Run `python device.py` to print it.
-- [archive/old_preprocessing_cells.py](archive/old_preprocessing_cells.py): the previous preprocessing cells, kept for reference (not run).
 - [sample-docs/](sample-docs/): sample scanned FIR case files.
 - [archive/page_classification_cells.py](archive/page_classification_cells.py): removed classification cells, kept for reference (not run).
 - [requirements.txt](requirements.txt): Python dependencies.
