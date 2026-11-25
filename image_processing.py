@@ -282,11 +282,23 @@ CONFIG = {
         "paper": 255,
     },
     "contrast": {
-        # Decided from ink_level (median grey of strokes) re-measured on the current image;
-        # threshold = CONFIG["assess"]["needs"]["faint_ink_level"]
-        "target_ink_level": 140,        # gamma chosen so the median ink reaches this grey level
-        "knee": 235,                    # lightness >= knee is left unchanged (paper stays white, texture not darkened)
-        "max_gamma": 2.5,
+        # Faint ink is detected per MARK, not per page: every connected stroke's core (its darkest pixel) is measured.
+        # Dark handwriting has cores ~30-90; light-grey printed toner / faded ink has cores ~130-215. A page whose
+        # faint-core marks are a real share of its ink gets a monotone tone curve; others are left alone.
+        "faint_core_min": 110,          # a mark whose core is lighter than this counts as faint
+        "faint_min_mark_mm2": 0.10,     # marks smaller than this are ignored (grain, specks)
+        "measure_threshold": "stroke_ink",  # marks used to MEASURE the faint level (CONFIG["assess"] black-hat level)
+        "apply_threshold": "stroke_weak",   # marks the curve is APPLIED to: the weak level also reaches the faintest
+                                            # printed letters (measuring with it anchored the curve near paper)
+        "mark_pad_px": 1,               # the curve is applied ONLY to faint marks (+ this soft edge): paper, dark
+                                        # handwriting, photos, stamps are untouched (a whole-page curve flattened
+                                        # dark photos in the self-test)
+        "faint_share_min": 0.10,        # apply when >= 10% of the ink area is faint marks
+        "target_faint_core": 80,        # the typical faint core is mapped to this grey (clearly readable; 110 was
+                                        # still light on faint printed form text)
+        "knee": 240,                    # lightness >= knee (paper) is never changed
+        "max_faint_slope": 3.5,         # limit on how strongly the faint..paper range is stretched (noise)
+        "smooth": 9,                    # smoothing of the curve (LUT entries); keeps it monotone
     },
     "device_overrides": {},       # any device-profile key, e.g. {"num_workers": 2}
     "review": {                   # thresholds that raise review flags
@@ -336,7 +348,7 @@ CONFIG = {
             "stroke_change_pct": 5,     # dark-population (front) stroke pixels changed by more than this % -> "ink_change"
         },
         "contrast": {
-            "still_faint_level": 170,   # median ink grey after -> "still_faint"
+            "still_faint_core": 170,    # typical faint core still lighter than this after -> "still_faint"
             "noise_rise_sigma": 0.5,    # noise sigma rose by more than this -> "noise_amplified"
             "texture_rise_pct": 0.5,    # texture % rose by more than this -> "noise_amplified"
         },
@@ -1847,6 +1859,7 @@ def step9_bleed(rec: dict) -> None:
         return
 
     out, mask = suppress_bleed(img, stats, rec["dpi"], cfg, CONFIG["assess"])
+    rec["images"]["bleed_mask"] = mask                          # Step 10 must not darken show-through again
     # front strokes = strokes that are not part of the lightened population; compare before/after
     keep = ~cv2.dilate(mask.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
     f_before = stroke_pixels(np.where(keep[..., None], img, 255).astype(np.uint8), rec["dpi"],
@@ -1874,24 +1887,54 @@ def step9_bleed(rec: dict) -> None:
 STEP10 = "step10_contrast"
 
 
-def ink_gamma(ink_level: float, cfg: dict) -> float:
-    knee = cfg["knee"]
-    lvl = min(max(ink_level, 1.0), knee - 1.0)
-    target = min(cfg["target_ink_level"], lvl)
-    return float(np.clip(np.log(target / knee) / np.log(lvl / knee), 1.0, cfg["max_gamma"]))
+def faint_ink_stats(img: np.ndarray, dpi: float, cfg: dict, acfg: dict, return_mask: bool = False):
+    """Per-mark faint-ink measure: share of ink area in marks whose core (darkest pixel) is lighter than
+    faint_core_min, and the median core of those marks (+ the faint-mark mask if return_mask)."""
+    g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    sk = mm_to_px(acfg["stroke_width_max_mm"], dpi, odd=True)
+    bh = cv2.morphologyEx(g, cv2.MORPH_BLACKHAT, cv2.getStructuringElement(cv2.MORPH_RECT, (sk, sk)))
+    ink = (bh > acfg[cfg.get("_threshold", cfg["measure_threshold"])]).astype(np.uint8)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
+    idx = lab.ravel()
+    m = idx > 0
+    gb = cv2.GaussianBlur(g, (3, 3), 0).ravel().astype(np.float64)
+    core = np.full(n, 255.0)
+    np.minimum.at(core, idx[m], gb[m])
+    area = st[:, cv2.CC_STAT_AREA].astype(np.float64)
+    big = area >= cfg["faint_min_mark_mm2"] * (dpi / 25.4) ** 2
+    big[0] = False
+    faint = big & (core > cfg["faint_core_min"])
+    total = area[big].sum()
+    stats = {"faint_share": round(float(area[faint].sum() / total), 3) if total else 0.0,
+             "faint_core": round(float(np.median(core[faint])), 1) if faint.any() else None,
+             "dark_core": round(float(np.median(core[big & ~faint])), 1) if (big & ~faint).any() else None}
+    return (stats, faint[lab]) if return_mask else stats
 
 
-def apply_tone_curve(img: np.ndarray, gamma: float, knee: float) -> np.ndarray:
-    x = np.arange(256, dtype=np.float32)
-    lut = np.where(x < knee, knee * (x / knee) ** gamma, x)
-    lut = np.clip(lut + 0.5, 0, 255).astype(np.uint8)
+def faint_ink_curve(faint_core: float, cfg: dict) -> np.ndarray:
+    """Monotone LUT through (0,0), (faint_core, target), (knee, knee), (255,255), smoothed. Below the diagonal:
+    ink gets darker, paper (>= knee) is untouched, tone order never changes (nothing can be erased)."""
+    knee, target = float(cfg["knee"]), float(cfg["target_faint_core"])
+    fc = float(np.clip(faint_core, target + 1, knee - 1))
+    target = max(target, knee - cfg["max_faint_slope"] * (knee - fc))      # limit the stretch above the faint core
+    x = np.arange(256, dtype=np.float64)
+    lut = np.interp(x, [0, fc, knee, 255], [0, target, knee, 255])
+    k = int(cfg["smooth"]) | 1
+    if k > 1:
+        pad = np.pad(lut, (k // 2, k // 2), mode="edge")
+        lut = np.convolve(pad, np.ones(k) / k, mode="valid")              # moving average keeps it monotone
+    lut[int(knee):] = x[int(knee):]                                        # paper exactly unchanged
+    return np.clip(np.round(np.maximum.accumulate(lut)), 0, 255).astype(np.uint8)
+
+
+def apply_lightness_lut(img: np.ndarray, lut: np.ndarray) -> np.ndarray:
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
     lab[..., 0] = cv2.LUT(lab[..., 0], lut)
     return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
 
 def step10_contrast(rec: dict) -> None:
-    if rec["metrics"].get(STEP10):                             # re-running the cell: start this step clean
+    if rec["metrics"].get(STEP10):                             # re-running: start this step clean
         rec["flags"] = [f for f in rec["flags"] if f["step"] != STEP10]
         rec["actions"] = [a for a in rec["actions"] if a[0] != STEP10]
     cfg, review = CONFIG["contrast"], CONFIG["review"]["contrast"]
@@ -1901,25 +1944,39 @@ def step10_contrast(rec: dict) -> None:
         rec["metrics"][STEP10] = {"applied": False}
         return
     t0 = time.perf_counter()
-    before = assess_page(img, CONFIG["assess"], rec["dpi"])
-    if before["ink_level"] < CONFIG["assess"]["needs"]["faint_ink_level"]:
+    st = faint_ink_stats(img, rec["dpi"], cfg, CONFIG["assess"])
+    _, faint_mask = faint_ink_stats(img, rec["dpi"], {**cfg, "_threshold": cfg["apply_threshold"]}, CONFIG["assess"],
+                                    return_mask=True)
+    if st["faint_share"] < cfg["faint_share_min"] or st["faint_core"] is None:
         rec["images"]["contrast"] = img
-        rec["metrics"][STEP10] = {"applied": False, "ink_level": before["ink_level"]}
-        add_action(rec, STEP10, f"ink dark enough (median {before['ink_level']})")
+        rec["metrics"][STEP10] = {"applied": False, **st}
+        add_action(rec, STEP10, f"no faint ink to strengthen (faint marks {st['faint_share']:.0%} of ink)")
         return
-    gamma = ink_gamma(before["ink_level"], cfg)
-    out = apply_tone_curve(img, gamma, cfg["knee"])
+    lut = faint_ink_curve(st["faint_core"], cfg)
+    # only on the faint marks (+ soft edge): everything else keeps its exact pixels
+    if rec["images"].get("bleed_mask") is not None:            # show-through page (Step 9): strengthen only GREY
+        neutral = (img.max(axis=2).astype(np.int16) - img.min(axis=2)) < CONFIG["assess"]["ink_chroma_min"]
+        faint_mask = faint_mask & neutral                       # faint marks (print), never the faint coloured
+                                                                # show-through that Step 9 lightened or protected
+    pad = 2 * int(cfg["mark_pad_px"]) + 1
+    alpha = cv2.GaussianBlur(cv2.dilate(faint_mask.astype(np.uint8), np.ones((pad, pad), np.uint8)).astype(np.float32),
+                             (0, 0), 0.7)[..., None]
+    out = np.clip(apply_lightness_lut(img, lut).astype(np.float32) * alpha + img.astype(np.float32) * (1 - alpha) + 0.5,
+                  0, 255).astype(np.uint8)
+    before = assess_page(img, CONFIG["assess"], rec["dpi"])
     after = assess_page(out, CONFIG["assess"], rec["dpi"])
+    st_after = faint_ink_stats(out, rec["dpi"], {**cfg, "faint_core_min": -1}, CONFIG["assess"])
+    core_after = int(lut[int(round(st["faint_core"]))])
     rec["images"]["contrast"] = out
-    rec["metrics"][STEP10] = {"applied": True, "gamma": round(gamma, 2),
-                              "ink_level": [before["ink_level"], after["ink_level"]],
+    rec["metrics"][STEP10] = {"applied": True, **st, "faint_core_after": core_after,
+                              "curve": {"faint_core": st["faint_core"], "maps_to": core_after, "knee": cfg["knee"]},
                               "noise_sigma": [before["noise_sigma"], after["noise_sigma"]],
                               "texture_pct": [before["texture_pct"], after["texture_pct"]],
                               "time_ms": round((time.perf_counter() - t0) * 1000)}
-    add_action(rec, STEP10, f"tone curve gamma {gamma:.2f} below L {cfg['knee']}: median ink "
-                            f"{before['ink_level']} -> {after['ink_level']}")
-    if after["ink_level"] >= review["still_faint_level"]:
-        add_flag(rec, STEP10, "still_faint", f"median ink still {after['ink_level']}")
+    add_action(rec, STEP10, f"faint marks {st['faint_share']:.0%} of ink (core {st['faint_core']:.0f}): monotone curve "
+                            f"{st['faint_core']:.0f} -> {core_after}, paper (>= {cfg['knee']}) unchanged")
+    if core_after >= review["still_faint_core"]:
+        add_flag(rec, STEP10, "still_faint", f"faint ink core {st['faint_core']:.0f} -> {core_after}")
     if (after["noise_sigma"] - before["noise_sigma"] > review["noise_rise_sigma"]
             or after["texture_pct"] - before["texture_pct"] > review["texture_rise_pct"]):
         add_flag(rec, STEP10, "noise_amplified", f"noise {before['noise_sigma']} -> {after['noise_sigma']}, "
@@ -2032,8 +2089,8 @@ def applied_steps(rec: dict) -> list:
                                                      "min_gap_L", "light_share")},
         {k: s9.get(k) for k in ("groups", "lightened_pct", "front_change_pct")})
     s10 = m.get(STEP10, {})
-    add(STEP10, "contrast (faint ink)", s10.get("applied"), {"gamma": s10.get("gamma"), "knee": C["contrast"]["knee"]},
-        {k: s10.get(k) for k in ("ink_level", "noise_sigma", "texture_pct")})
+    add(STEP10, "faint ink", s10.get("applied"), s10.get("curve") or {},
+        {k: s10.get(k) for k in ("faint_share", "faint_core", "faint_core_after", "dark_core", "noise_sigma", "texture_pct")})
     s11 = m.get(STEP11, {})
     bw_on = C["output"]["bw"].get("enabled", False)
     add(STEP11, "final image", True, {"black_and_white": dict(C["output"]["bw"]) if bw_on else "off"},

@@ -340,22 +340,22 @@ Calculates the metrics that turn the later steps on or off and stores them in `r
   - Show-through overlapping the front writing stays.
   - Black-ink bleed-through is not handled.
 
-### Step 10 — Contrast enhancement (faint ink) ✅ implemented
-- **Input:** `images["bleed_clean"]`. Output: `images["contrast"]`.
-- **Detect on the current image:** median grey of strokes (`ink_level`, from `assess_page`). Act at ≥ 180.
-- **Method (adaptive tone curve on Lab L only):**
-  - Below a knee at L = 235: `L' = knee × (L/knee)^γ`; at and above it, unchanged.
-  - γ is chosen so the median ink reaches 140, capped at 2.5.
-  - Paper stays exactly white, near-white texture is not darkened, the curve is monotone, and colour is untouched.
-  - *Not CLAHE*, as first planned: the paper is already uniform after Step 6, and local equalisation would bring back paper texture.
-- **Verify:** ink level, noise and texture before → after.
-- **Review flags:** `still_faint` (median ink ≥ 170 after), `noise_amplified` (σ +0.5 or texture +0.5%).
-- **Result on the samples:**
-  - 12 pages enhanced (γ 2.0–2.5): median ink 181–198 → 148–181;
-  - noise and texture flat except on FIR-1-2017 p12, the grey photocopy, whose leftover grain darkens with the ink.
-  - 3 pages flagged: p12 (`still_faint`, `noise_amplified`), and FIR-2-2009 p8 and FIR-4-2013 p7 (`still_faint`, 172–174 at the γ cap).
-
-  The medians land above the 140 target because, once darkened, the faintest strokes start to count as ink.
+### Step 10 — Faint ink strengthening ✅ (revised: detect per mark)
+- **Why the first version missed it:** it looked at the **median** darkness of all ink. On form pages the dark handwriting kept the median "dark enough" (e.g. 164 on FIR-2-2009 p1/p4), so light-grey printed labels ("Act", "Sections", "Action taken…") were never strengthened.
+- **Detect (per mark):**
+  - Every connected stroke's **core** (darkest pixel) is measured: dark handwriting ≈ 30–90, light printed toner or faded ink ≈ 130–215.
+  - Faint marks are those with a core above 110 and an area of at least 0.1 mm².
+  - The step runs only if faint marks make up ≥ 10% of the ink area. On the samples that's 38 pages, including FIR-2-2009 p1 (27%) and p4 (31%); clean pages sit at 2–5%.
+- **Fix:**
+  - A monotone, smoothed tone curve through (0, 0), (faint core → 80), (240 → 240), (255 → 255), on lightness only.
+  - It is applied **only to the faint marks** (+1 px soft edge). Paper, dark handwriting, photos and stamps keep their exact pixels.
+  - Monotone means no stroke can disappear; colour is unchanged.
+  - On show-through pages (Step 9 applied) only **grey** faint marks are strengthened, so lightened show-through is not darkened again.
+- **Rejected on the way:**
+  - A whole-page curve: the self-test caught a dark photo flattened (detail 32 → 22).
+  - Measuring with the weak stroke threshold: it anchored the curve near paper and barely darkened anything.
+  - Faint core → 110: still too light.
+- **Result:** FIR-2-2009 p4 printed text mean grey 194 → 155, darkest tenth 140 → 65. All 7 self-test traps pass. One flag: FIR-1-2017 p12 `noise_amplified` (the grainy photocopy slip).
 
 ### Step 11 — Final outputs ✅ implemented
 - **Files:** see *Output naming* under *Code review*. `{doc}_{page}_original.jpg`, `_cleaned.png`, `_cleaned_bw.png`, `_params.json` per page; `{doc}_metrics.json` per document; `summary.json`. Stage images (`{doc}_{page}_stageNN_<stage>.jpg`) only when `save_stages` / the GB10 profile.
