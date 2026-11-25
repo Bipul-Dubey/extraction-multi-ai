@@ -2,7 +2,7 @@
 
 A Jupyter Notebook (`app.ipynb`) that cleans scanned police First Information Report (FIR) case files page by page using **OpenCV + NumPy only**: no third-party AI models, no cloud APIs, no external OCR engines.
 
-> **Current focus: image preprocessing.** Page classification (labelling each page as IIF-1…IIF-5, medical, etc.) is **paused** until preprocessing is finished. The previous classification cells were removed from the notebook and saved in [archive/page_classification_cells.py](archive/page_classification_cells.py) for reference. Nothing in that file runs.
+> **Status:** image preprocessing is done (`image_processing.py`). Next: page classification + FIR field extraction with a local vision model (Qwen3-VL via Ollama).
 
 ---
 
@@ -440,7 +440,7 @@ Pages are zero-padded to 3 digits (more for longer documents), so files sort in 
 The page-labelling work restarts after preprocessing is approved. Notes for later:
 - **Label set:** IIF-1 FIR, IIF-2 Crime Details, IIF-3 Arrest/Court Surrender, IIF-4 Seizure, IIF-5 Final Report, Medical / X-ray / Injury, handwritten statement, site sketch, blank.
 - **Strongest printed clue:** the top-right corner mark `I.I.F.-x / एकीकृत जाँच फार्म-x, पृष्ठ सं.-n` (form and page number within the form).
-- **Must follow the no-third-party-AI/OCR rule.** The archived cells used Surya OCR v2, which will have to be replaced.
+- **Will run on a local vision model** (Qwen3-VL via Ollama on the server): data stays local.
 
 ---
 
@@ -502,5 +502,4 @@ Run the cells top to bottom. Each step prints its per-page metrics and what it d
 - [app.ipynb](app.ipynb): review notebook. It runs the module's steps one by one with tables and before/after views.
 - [device.py](device.py): detects Mac M5 / NVIDIA GB10 / generic CPU and returns the settings profile. Run `python device.py` to print it.
 - [sample-docs/](sample-docs/): sample scanned FIR case files.
-- [archive/page_classification_cells.py](archive/page_classification_cells.py): removed classification cells, kept for reference (not run).
 - [requirements.txt](requirements.txt): Python dependencies.
